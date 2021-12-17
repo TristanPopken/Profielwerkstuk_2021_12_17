@@ -1,5 +1,6 @@
-"# Profielwerkstuk_2021_12_17" 
-"# Profielwerkstuk_2021_12_17" 
-"# Profielwerkstuk_2021_12_17" 
-"# Profielwerkstuk_2021_12_17" 
-"# Profielwerkstuk_2021_12_17" 
+Maartenscollege - Haaren,
+Profielwerkstuk VWO 6, 17-12-2021
+@Tristan Emiel Popken
+
+Code: src/me/TristanPopken/OpenGL/
+Resources: res/
