@@ -1,0 +1,29 @@
+#version 400 core
+
+in vec2 pass_textureCoords;
+in vec3 toLightVector;
+in vec3 toCameraVector;
+in float vFragDepth;
+in vec3 surfaceNormal;
+
+out vec4 out_Color;
+
+uniform sampler2D ts;
+uniform sampler2D normalMap;
+uniform vec3 lightColour;
+uniform float shineDamper;
+uniform float reflectivity;
+
+const float FAR = 100000;
+const float logDepthBufFC = 1.0 / log(FAR + 1.0) * (log(2)/log(2.71828182846));
+
+void main(void) {
+	
+	gl_FragDepth = log2(vFragDepth) * logDepthBufFC;
+	
+	out_Color = texture(ts, pass_textureCoords);
+	//out_Color = vec4(1,0,0,1);// * dot(surfaceNormal, toLightVector);
+	return;
+	
+}
+

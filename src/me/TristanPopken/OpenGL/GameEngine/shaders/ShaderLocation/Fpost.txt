@@ -1,0 +1,323 @@
+#version 400
+#define PI 3.1415926538
+
+in vec2 screenPos;
+in vec2 texturePos;
+
+out vec4 out_Colour;
+
+uniform sampler2D colorTexture;
+uniform sampler2D depthTexture;
+uniform sampler2D waveNormalTexture1;
+uniform sampler2D waveNormalTexture2;
+uniform sampler2D waveDuDv;
+uniform mat4 negViewMatrix;
+uniform mat4 negProjMatrix;
+uniform vec3 cameraPos;
+uniform vec3 scatteringCoefficients;
+uniform vec3 sunPos;
+uniform float time;
+
+uniform float near;
+uniform float far;
+
+uniform float variable;
+
+vec3 dirToSun = normalize(-sunPos);
+const int planetRadius = 637;
+const int planetRadiusSquared = planetRadius * planetRadius;
+const float sunRadiusSquared = 45665301736.0;
+const float moonDist = 38440;
+const float moonRadiusSquared = 30185.5876;
+const float radius = 637+20;
+const float radiusSquared = radius*radius;
+float cameraAltitude = length(cameraPos)-planetRadius;
+
+const int inScatterPoints = 7;
+const int opticalDepthPoints = 4;
+
+const float brightnessFactor = 1.5;
+const float densityFalloff = 2.0;
+
+const vec4 oceanColor1 = vec4(18,54,109,255)/255.0;
+const vec4 oceanColor2 = vec4(38,107,127,255)/255.0;
+
+const float epsilon = 0.01;
+
+const float FARR = 100000;
+const float logDepthBufFC = 1.0 / log(FARR + 1.0) * (log(2.0)/log(2.71828182846));
+
+//---------------------------------------------< UNDERNEATH THIS DO NOT CHANGE >----------------------------------------------------------//
+
+vec3 unpackNormal(vec4 col) {
+	return normalize(col.rgb*2.0-1.0);
+}
+
+vec3 blend_rnm(vec3 n1, vec3 n2) {
+	n1.z += 1;
+	n2.xy = -n2.xy;
+	return n1 * dot(n1, n2) / n1.z - n2;
+}
+
+vec2 time1 = vec2(time*10.1, time* 8.1) * 0.000012;
+vec2 time2 = vec2(time* 9.9, time* 8.1) * 0.000012 * 0.73;
+vec2 time3 = vec2(time*-7.9, time*-3.1) * 0.000012;
+
+vec3 getWaveNormal(vec3 pos, vec3 normal) {
+	//Samples the new normal from a normal map (In tangent space)
+	vec4 cx1 = texture(waveNormalTexture1, pos.yz*20000+time1); vec4 cx2 = texture(waveNormalTexture1, pos.zy*10190+time2);
+	vec4 cy1 = texture(waveNormalTexture1, pos.xz*20000+time1); vec4 cy2 = texture(waveNormalTexture1, pos.zx*10190+time2);
+	vec4 cz1 = texture(waveNormalTexture1, pos.xy*20000+time1); vec4 cz2 = texture(waveNormalTexture1, pos.yx*10190+time2);
+	
+	vec4 cx3 = texture(waveNormalTexture2, pos.yz*19305+time2); vec3 cx = unpackNormal(0.33333*(cx1+cx2+cx3));
+	vec4 cy3 = texture(waveNormalTexture2, pos.xz*19305+time2); vec3 cy = unpackNormal(0.33333*(cy1+cy2+cy3));
+	vec4 cz3 = texture(waveNormalTexture2, pos.xy*19305+time2); vec3 cz = unpackNormal(0.33333*(cz1+cz2+cz3));
+	
+	//Triplanar mapping squishes 3 maps into 1, to fix lighting you want mapx + mapy + mapz to be 1
+	vec3 absNormal = abs(normal);
+	vec3 bW = absNormal;
+	bW /= bW.x + bW.y + bW.z;
+	
+	//Convert normals to match tangent space in order to add the new normals
+	cx = blend_rnm(0.5*vec3(normal.zy, absNormal.x), cx);
+	cy = blend_rnm(0.5*vec3(normal.xz, absNormal.y), cy);
+	cz = blend_rnm(0.5*vec3(normal.xy, absNormal.z), cz);
+	
+	//The absolute value of the normal was required in the calculation. This reverts it back to negative numbers if necessary
+	vec3 axisSign = sign(normal);
+	cx.z *= axisSign.x;
+	cy.z *= axisSign.y;
+	cz.z *= axisSign.z;
+	
+	//Convert back to world space from tangent space and blend together with the blendWeight
+	return normalize(cx.zyx * bW.x + cy.xzy * bW.y + cz.xyz * bW.z);
+}
+
+vec4 getColorFromTexture(sampler2D ts, vec3 unitCoord, vec2 offset, float factor) {//TriPlanarMapping
+	vec4 cx = texture(ts, unitCoord.yz*factor+offset);
+	vec4 cy = texture(ts, unitCoord.xz*factor+offset);
+	vec4 cz = texture(ts, unitCoord.xy*factor+offset);
+	float bWx = pow(abs(unitCoord.x), 10); //bW is blend Weight, 10 is the scalar.
+	float bWy = pow(abs(unitCoord.y), 10);
+	float bWz = pow(abs(unitCoord.z), 10);
+	vec3 bW = vec3(bWx, bWy, bWz) / (bWx + bWy + bWz);//To make x + y + z = 1 instead of x*x + y*y + z*z = 1
+	return cx*bW.x + cy*bW.y + cz*bW.z;
+}
+
+float raySphere(vec3 off, vec3 dir) {//Only works from withing sphere
+	
+	float b = dot(off, dir);
+	float c = dot(off, off) - radiusSquared;
+	
+	return -b + sqrt(b * b - c);
+}
+
+float densityAtPoint(vec3 point) {
+	float heightAboveSurface = length(point) - planetRadius;
+	float height01 = heightAboveSurface / (radius - planetRadius);
+	return exp(-height01 * densityFalloff) * (1 - height01);
+}
+
+float opticalDepth(vec3 rayOrigin, vec3 rayDir, float rayLength) {
+	
+	float stepSize = rayLength / (opticalDepthPoints - 1.0);
+	vec3 dDist = rayDir * stepSize;
+	
+	vec3 densitySamplePoint = rayOrigin;
+	float opticalDepth = 0;
+	
+	for (int i = 0; i < opticalDepthPoints; i++) {
+		float localDensity = densityAtPoint(densitySamplePoint);
+		opticalDepth += localDensity * stepSize;
+		densitySamplePoint += dDist;
+	}
+	return opticalDepth;
+}
+
+vec3 calculateLight(vec3 rayOrigin, vec3 rayDir, float rayLength, vec3 originalCol, float transmittanceFactor, int isSkybox, int isPlanet) {
+	
+	float stepSize = rayLength / (inScatterPoints - 1.0);
+	vec3 dDist = rayDir * stepSize;
+	
+	float totalDensity = 0;
+	vec3 inScatterPoint = rayOrigin;
+	vec3 inScatteredLight = vec3(0.0, 0.0, 0.0);
+	float viewRayOpticalDepth = 0;
+	
+	for (int i = 0; i < inScatterPoints - 1; i++) {
+		
+		float sunRayLength = raySphere(inScatterPoint, dirToSun);
+		
+		float sunRayOpticalDepth = opticalDepth(inScatterPoint, dirToSun, sunRayLength);
+		viewRayOpticalDepth = opticalDepth(inScatterPoint, -rayDir, stepSize * i);
+		
+		vec3 transmittance = exp(scatteringCoefficients * -(sunRayOpticalDepth + viewRayOpticalDepth));
+		float localDensity = densityAtPoint(inScatterPoint);
+		
+		inScatteredLight += localDensity * transmittance * scatteringCoefficients * stepSize;
+		totalDensity += localDensity;
+		inScatterPoint += dDist;
+	}
+	
+	//---< Code For Sun >---//
+	float SunSize = 0.001;
+	float SunAngle = 1 - max(dot(rayDir, dirToSun) - (1 - SunSize), 0) / SunSize;
+	vec3 SunTransmittance = exp(scatteringCoefficients * -SunAngle * 800) * pow(1 - SunAngle, 2);
+	vec3 SunLight = totalDensity * SunTransmittance * scatteringCoefficients * 500;
+	inScatteredLight += SunLight * SunLight.r * (1 - isPlanet);
+	
+	//---< Code for Skybox when entering atmosphere >---//
+	float height = min(cameraAltitude/20.0, 1);
+	float heightFactor = 1 - pow(height, 2);
+	float nightFactor = min(length(inScatteredLight) * 6.0, 1);
+	float skyboxTransmittanceFactor = 1 - isSkybox * heightFactor * nightFactor; //When 1: Stars, When 0: no stars
+	                                    //When any of these floats become 0, the original color will stay. A bit like an ORgate
+	
+	//---< Final Calculation >---//
+	float originalColTransmittance = max(exp(-viewRayOpticalDepth / 20.0), 1 - length(inScatteredLight) * 1.5);
+	return originalCol * originalColTransmittance * skyboxTransmittanceFactor + inScatteredLight * brightnessFactor;
+}
+
+//---------------------------------------------< ABOVE THIS DO NOT CHANGE >----------------------------------------------------------//
+
+void main(void) {
+	
+	//---< Color >---//
+	
+	vec4 color = texture(colorTexture, texturePos);
+	
+	//---< Vectors >---//
+	
+	vec4 coords = negProjMatrix * vec4(screenPos.x, screenPos.y, -1.0, 1.0);
+	coords = negViewMatrix * vec4(coords.x, coords.y, -1.0, 0.0);
+	vec3 dir = normalize(coords.xyz);
+	
+	//---< Depth >---//
+	
+	vec4 depthT = texture(depthTexture, texturePos);
+	float depth = pow(2, depthT.x / logDepthBufFC) - 1.0;
+	
+	//---< Goofy Radar System >---//
+	
+	//float input = log(depth)*10.0-time/100.0;
+	//float cosine = cos(input);
+	//float layer = floor(input/(2*PI));
+	//float Rc = mod(layer * 2943.2, 100); float Gc = mod(layer * 8322.3, 100); float Bc = mod(layer * 5904.1, 100);
+	//vec3 rgb = normalize(vec3(Rc, Gc, Bc)); color = mix(color, vec4(rgb, 1), mod(input,2*PI)/(2*PI));
+	//if (cosine>0.90 && mod(input,2*PI) > PI) {
+	//	float strength = 1 - (1 - cosine) * 10.0;
+	//	color = mix(color, vec4(1,0,0,1), strength);
+	//}
+	
+	//---< Ocean & Atmosphere >---//
+	
+	float dist = FARR/1.1; //Every time you see something the dist will be set to the closest thing
+	int isSkybox = 1;
+	int isPlanet = 0;
+	
+	if (depth < dist) {
+		dist = depth;
+		isSkybox = 0;
+		isPlanet = 1;
+	}
+	
+	vec3 off = cameraPos;
+	float b = dot(off, dir);
+	float bb = b * b;
+	float c = dot(off, off);
+	
+	float c_Atmos = c - radiusSquared;
+	float c_Ocean = c - planetRadiusSquared;
+	
+	float d_Atmos = bb - c_Atmos;
+	float d_Ocean = bb - c_Ocean;
+	
+	float s_Atmos = sqrt(d_Atmos);
+	float s_Ocean = sqrt(d_Ocean);
+	
+	float d1_Ocean = max(0, -b - s_Ocean);
+	float d2_Ocean = min(depth, -b + s_Ocean);
+	
+	if (d_Ocean * d2_Ocean > 0 && d1_Ocean < dist) {
+		
+		vec3 oceanNormal = normalize(cameraPos + d1_Ocean * dir);
+		vec3 oceanWaveNormal = getWaveNormal(oceanNormal, oceanNormal);
+		
+		vec4 dudv = (getColorFromTexture(waveDuDv, oceanNormal, time1*0.3, 10000.0) * 2 - 1) * 0.03;
+		color = texture(colorTexture, texturePos + dudv.xy);
+		
+		float waveFactor = 1 - clamp(cameraAltitude-0.5, 0,1);
+		oceanWaveNormal = mix(oceanNormal, oceanWaveNormal, waveFactor);
+		float waveInfluence = 1 - abs(dot(oceanWaveNormal, oceanNormal));
+		
+		float oceanDepth = d2_Ocean - d1_Ocean;
+		float oceanAngle = abs(dot(oceanNormal, dir));
+		
+		float oceanDepthFactor = max(0, 1.0 - oceanDepth * 20.0);
+		float brightness = clamp(dot(dirToSun, oceanNormal)+0.15, 0.1,1.0);
+		brightness += dot(dirToSun, oceanWaveNormal) * 0.2;
+		
+		vec4 rawOceanColor = mix(oceanColor1, oceanColor2, max(pow(1-oceanAngle, 6), clamp(waveInfluence*11.0, 0,1)));
+		
+		vec3 reflectedCameraDirection = reflect(dir, oceanWaveNormal);
+		float specularFactor = pow(max(0,dot(reflectedCameraDirection, dirToSun)), 30) * 0.4;
+		
+		float factor = mix(oceanAngle, 1.0, 0.75)*oceanDepthFactor;
+		color = mix(rawOceanColor, color, factor) * brightness + vec4(1,1,1,0)*2*specularFactor*mix(factor, 1.0, 0.5);
+		
+		out_Colour = color;
+		dist = d1_Ocean;
+		isPlanet = 1;
+		isSkybox = 0;
+	}
+	
+	float d1_Atmos = max(0, -b - s_Atmos);
+	float d2_Atmos = min(dist, -b + s_Atmos);
+	
+	//---< Sun & Moon >---//
+	
+	vec3 off_sun = cameraPos + sunPos;
+	float b_sun = dot(off_sun, dir);
+	float c_sun = dot(off_sun, off_sun) - sunRadiusSquared;
+	float d_sun = b_sun * b_sun - c_sun;
+	float s_sun = sqrt(d_sun);
+	float d1_sun = -b_sun - s_sun;
+	float d2_sun = -b_sun + s_sun;
+	
+	//--< Check if Discriminant is > 0 & Distance is closer>--//
+	if (d_sun * d2_sun > 0 && isSkybox == 1) {//d1_sun < dist
+		color = vec4(3, 2.4, 1.3, 1) * (d2_sun - d1_sun + 100) / (65579 * 2);
+		color.w = 1;
+		out_Colour = color;
+		dist = d1_sun;
+		isSkybox = 0;
+	}
+	
+	vec3 moonPos = vec3(moonDist * cos(time / 4000.0), 0, moonDist * sin(time / 4000.0));
+	vec3 off_moon = cameraPos + moonPos;
+	float b_moon = dot(off_moon, dir);
+	float c_moon = dot(off_moon, off_moon) - moonRadiusSquared;
+	float d_moon = b_moon * b_moon - c_moon;
+	float s_moon = sqrt(d_moon);
+	float d1_moon = max(0, -b_moon - s_moon);
+	float d2_moon =        -b_moon + s_moon;
+	
+	if (d_moon * d2_moon > 0 && d1_moon < dist) {
+		vec3 normal = normalize(d1_moon * dir + moonPos + cameraPos);
+		color = vec4(0.7, 0.7, 0.7, 1) * dot(normal, dirToSun);
+		out_Colour = color;
+		dist = d1_moon;
+		isSkybox = 0;
+	}
+	
+	//---< Atmosphere >---//
+	
+	if (d_Atmos * d2_Atmos > 0 && d1_Atmos < dist) {// d is for sphere intersection, d2 is to remove backwards second sphere
+		
+		vec3 light = calculateLight(cameraPos + dir * (d1_Atmos + epsilon), dir, d2_Atmos - d1_Atmos - epsilon * 2, color.xyz, 1.0, isSkybox, isPlanet);
+		out_Colour = vec4(light, 1.0);
+		return;
+	}
+	
+	out_Colour = color; //Nothing happened, Use Normal color
+}

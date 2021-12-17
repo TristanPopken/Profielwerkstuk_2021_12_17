@@ -1,0 +1,155 @@
+#version 400 core
+
+in vec2 pass_textureCoords;
+in vec3 unitCoord;
+in vec3 surfaceNormal;
+in vec3 toLightVector;
+in vec3 toCameraVector;
+in float vFragDepth;
+in float altitude;
+
+out vec4 out_Color;
+
+uniform sampler2D im1; //Climate
+uniform sampler2D im2;
+uniform sampler2D im3;
+uniform sampler2D im4;
+uniform sampler2D im5;
+uniform sampler2D im6;
+uniform sampler2D im7;
+uniform sampler2D im8; //rocks
+uniform sampler2D im9;
+uniform sampler2D im10; //normals
+uniform sampler2D im11;
+uniform vec3 lightColour;
+uniform float shineDamper;
+uniform float reflectivity;
+uniform float cameraHeight;
+
+uniform float variable;
+
+const float FAR = 100000;
+const float logDepthBufFC = 1.0 / log(FAR + 1.0) * (log(2)/log(2.71828182846));
+
+vec3 unpackNormal(vec4 col) {
+	return normalize(col.rgb*2.0-1.0);
+}
+
+vec3 blend_rnm(vec3 n1, vec3 n2) {
+	n1.z += 1;
+	n2.xy = -n2.xy;
+	return n1 * dot(n1, n2) / n1.z - n2;
+}
+
+vec3 getNormal(vec3 pos, vec3 normal) {
+	//Explenation about this function is in the post processing fragment shader
+	vec4 cx1 = texture(im10, pos.yz*4300.0); vec4 cx2 = texture(im11, pos.zy*4300.0);
+	vec4 cy1 = texture(im10, pos.xz*4300.0); vec4 cy2 = texture(im11, pos.zx*4300.0);
+	vec4 cz1 = texture(im10, pos.xy*4300.0); vec4 cz2 = texture(im11, pos.yx*4300.0);
+	
+	//Final normal is based on the rockyness <- the mix function
+	vec3 cx = unpackNormal(mix(cx1, cx2, pass_textureCoords.y));
+	vec3 cy = unpackNormal(mix(cy1, cy2, pass_textureCoords.y));
+	vec3 cz = unpackNormal(mix(cz1, cz2, pass_textureCoords.y));
+	
+	vec3 absNormal = abs(normal);
+	vec3 bW = absNormal;
+	bW /= bW.x + bW.y + bW.z;
+	
+	cx = blend_rnm(0.5*vec3(normal.zy, absNormal.x), cx);
+	cy = blend_rnm(0.5*vec3(normal.xz, absNormal.y), cy);
+	cz = blend_rnm(0.5*vec3(normal.xy, absNormal.z), cz);
+	
+	vec3 axisSign = sign(normal);
+	cx.z *= axisSign.x;
+	cy.z *= axisSign.y;
+	cz.z *= axisSign.z;
+	
+	//Convert back to world space from tangent space and blend together with the blendWeight
+	return normalize(cx.zyx * bW.x + cy.xzy * bW.y + cz.xyz * bW.z);
+}
+
+vec4 getColorFromTexture(sampler2D ts, float factor) {//TriPlanarMapping
+	vec4 cx = texture(ts, unitCoord.yz*factor);
+	vec4 cy = texture(ts, unitCoord.xz*factor);
+	vec4 cz = texture(ts, unitCoord.xy*factor);
+	float bWx = pow(abs(unitCoord.x), 10); //bW is blend Weight, 10 is the scalar.
+	float bWy = pow(abs(unitCoord.y), 10);
+	float bWz = pow(abs(unitCoord.z), 10);
+	vec3 bW = vec3(bWx, bWy, bWz) / (bWx + bWy + bWz);//To make x + y + z = 1 instead of x*x + y*y + z*z = 1
+	return cx*bW.x + cy*bW.y + cz*bW.z;
+}
+
+vec4 getColorPerHeight(float temp, float heightFactor) {
+	float f1 = max(0, 1.0 -     temp         / 10.0);//Poles
+	float f2 = max(0, 1.0 - abs(temp - 10.0) / 10.0);//Tundra
+	float f3 = max(0, 1.0 - abs(temp - 20.0) / 10.0);//Boreal
+	float f4 = max(0, 1.0 - abs(temp - 30.0) / 10.0);//Decidious
+	float f5 = max(0, 1.0 - abs(temp - 40.0) / 10.0);//Rainforest
+	float f6 = max(0, 1.0 -    (50.0 - temp) / 10.0);//Desert
+	vec4 c1 = getColorFromTexture(im1, heightFactor);
+	vec4 c2 = getColorFromTexture(im2, heightFactor);
+	vec4 c3 = getColorFromTexture(im3, heightFactor);
+	vec4 c4 = getColorFromTexture(im4, heightFactor);
+	vec4 c5 = getColorFromTexture(im5, heightFactor);
+	vec4 c6 = getColorFromTexture(im6, heightFactor);
+	vec4 beach = getColorFromTexture(im9, heightFactor);
+	vec4 color = c1*f1 + c2*f2 + c3*f3 + c4*f4 + c5*f5 + c6*f6;
+	color = mix(beach, color, clamp(altitude*altitude*altitude*90000,0,1));
+	vec4 rock1 = getColorFromTexture(im7, heightFactor); //rock
+	vec4 rock2 = getColorFromTexture(im8, heightFactor); //sandstone
+	vec4 rockColor = rock1 * (1-f6) + rock2 * f6;
+	return color * (1-pass_textureCoords.y) + rockColor * pass_textureCoords.y;
+}
+
+vec4 getColor(float temp) {
+	temp = clamp(temp, 0, 50);
+	
+	float depth = (vFragDepth + cameraHeight) * 0.47;
+	float v = log(depth)-1;
+	
+	vec4 c1 = getColorPerHeight(temp, 10000.0);
+	vec4 c2 = getColorPerHeight(temp,   800.0);
+	vec4 c3 = getColorPerHeight(temp,   100.0);
+	vec4 c4 = getColorPerHeight(temp,    10.0);
+	vec4 c5 = getColorPerHeight(temp,     2.0);
+	
+	//https://www.desmos.com/calculator/ppvstzgstq?lang=nl
+	float f = 4.0;
+	float f1 = clamp(0.5-f*(v+0.7)                ,0,1);
+	float f2 = clamp(0.5+f*(0.70-abs(v+0.7-0.70)) ,0,1);
+	float f3 = clamp(0.5+f*(0.65-abs(v-0.7-0.65)) ,0,1);
+	float f4 = clamp(0.5+f*(1.15-abs(v-2.0-1.15)) ,0,1);
+	float f5 = clamp(0.5+f*(v-4.3)                ,0,1);
+	
+	return c1*f1 + c2*f2 + c3*f3 + c4*f4 + c5*f5;
+}
+
+void main(void) {
+	
+	gl_FragDepth = log2(vFragDepth) * logDepthBufFC;
+	
+	vec3 unitNormal = normalize(surfaceNormal);
+	vec3 unitDeltaNormal = getNormal(unitCoord, unitNormal);
+	
+	vec3 unitLightVector = normalize(toLightVector);
+	vec3 unitVectorToCamera = normalize(toCameraVector);
+	
+	float brightness = clamp(dot(unitNormal, unitLightVector)+0.1,0.1,1.0);
+	brightness += dot(unitDeltaNormal, unitLightVector) * 0.4;
+	vec3 diffuse = brightness * lightColour;
+	
+	out_Color = getColor(pass_textureCoords.x) * vec4(diffuse, 1.0);
+	
+	//Currently no specular lighting on the planet
+	//vec3 lightDirection = unitLightVector;
+	//vec3 reflectedLightDirection = reflect(lightDirection, unitNormal);
+	
+	//float specularFactor = dot(reflectedLightDirection, unitVectorToCamera);
+	//specularFactor = max(specularFactor, 0.0);
+	//float dampedFactor = pow(specularFactor, shineDamper);
+	//vec3 finalSpecular = dampedFactor * reflectivity * lightColour;
+	
+	//float specularHeightFactor = 0.1;
+	
+}
